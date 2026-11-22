@@ -144,9 +144,7 @@ function stroke(V) {
 }
 
 
-PenUp=false;
-D =[3,-Math.PI/2]
-stroke(D);
+
 
 
 
