@@ -281,21 +281,19 @@ function LL(x,y) {
 }
 
 
-// ================== IMAGE DRAWING (append to the END of c1.js) ==================
-// Pipeline: image -> grayscale -> blur -> Sobel + thin edges -> trace into strokes
-//           -> simplify -> map into the arm's reachable "paper" -> animate with IK
+// ============ IMAGE DRAWING + COLOUR (replaces the previous block at the END of c1.js) ============
+// Colour pipeline: image -> k-means palette -> hatch-fill each colour region with scanlines
+//                  (pen "changes colour" per palette entry, lightest first) -> black edge outlines on top.
 
-// "Paper" in SVG coordinates. The base sits at (-200,0) and reach is 100..300,
-// so this box (corner distances ~136..282 from the base) is safely reachable.
-const DRAW_BOX = { x0: -90, y0: -80, w: 160, h: 160 };
-const RES = 110;            // image is shrunk so its longest side = RES pixels
-let drawJob = null;         // requestAnimationFrame handle
-let imgEl = null;           // currently loaded image
+const DRAW_BOX = { x0: -90, y0: -80, w: 160, h: 160 };  // reachable "paper" in SVG coords
+const RES = 110;            // resolution used for outlines
+const RES_FILL = 64;        // resolution used for colour fill (lower = faster drawing)
+let drawJob = null;
+let imgEl = null;
 
 const SVGNS = "http://www.w3.org/2000/svg";
 const armGroup = svg.querySelector("g");
 
-// paper + layer for the drawing, placed UNDER the arm
 const paper = document.createElementNS(SVGNS, "rect");
 paper.setAttribute("x", DRAW_BOX.x0); paper.setAttribute("y", DRAW_BOX.y0);
 paper.setAttribute("width", DRAW_BOX.w); paper.setAttribute("height", DRAW_BOX.h);
@@ -305,30 +303,29 @@ svg.insertBefore(paper, armGroup);
 const drawLayer = document.createElementNS(SVGNS, "g");
 svg.insertBefore(drawLayer, armGroup);
 
-function setStatus(msg) {
-    const s = document.getElementById("status");
-    if (s) s.textContent = msg;
-}
+// small helpers so missing controls fall back to defaults
+function setStatus(msg) { const s = document.getElementById("status"); if (s) s.textContent = msg; }
+function val(id, def) { const e = document.getElementById(id); return e ? +e.value : def; }
+function isOn(id, def) { const e = document.getElementById(id); return e ? e.checked : def; }
+const lum = c => 0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2];
 
 // ---------- 1. Image processing ----------
-function imageToGray(img) {
-    const s = RES / Math.max(img.width, img.height);
+function imageToGray(img, res = RES) {          // EDITED: resolution param + returns raw RGBA too
+    const s = res / Math.max(img.width, img.height);
     const w = Math.max(3, Math.round(img.width * s));
     const h = Math.max(3, Math.round(img.height * s));
     const c = document.createElement("canvas");
     c.width = w; c.height = h;
     const ctx = c.getContext("2d");
-    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);   // transparent PNGs -> white
+    ctx.fillStyle = "#fff"; ctx.fillRect(0, 0, w, h);
     ctx.drawImage(img, 0, 0, w, h);
     const d = ctx.getImageData(0, 0, w, h).data;
     const g = new Float32Array(w * h);
-    for (let i = 0; i < w * h; i++) {
-        g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
-    }
-    return { g, w, h };
+    for (let i = 0; i < w * h; i++) g[i] = 0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2];
+    return { g, w, h, d };
 }
 
-function blurGray(g, w, h) {          // 3x3 box blur to kill noise
+function blurGray(g, w, h) {
     const o = new Float32Array(g);
     for (let y = 1; y < h - 1; y++) {
         for (let x = 1; x < w - 1; x++) {
@@ -340,7 +337,6 @@ function blurGray(g, w, h) {          // 3x3 box blur to kill noise
     return o;
 }
 
-// Sobel gradient + non-maximum suppression => thin (1px) edges
 function detectEdges(g, w, h, thr) {
     const mag = new Float32Array(w * h);
     const dir = new Uint8Array(w * h);
@@ -359,26 +355,76 @@ function detectEdges(g, w, h, thr) {
     for (let y = 1; y < h - 1; y++) {
         for (let x = 1; x < w - 1; x++) {
             const i = y * w + x;
-            const off = [1, w + 1, w, w - 1][dir[i]];   // neighbours along the gradient
+            const off = [1, w + 1, w, w - 1][dir[i]];
             if (mag[i] > thr && mag[i] > mag[i - off] && mag[i] >= mag[i + off]) edge[i] = 1;
         }
     }
     return edge;
 }
 
-// ---------- 2. Turn edge pixels into pen strokes ----------
+// ---------- 2a. NEW: colour quantisation (k-means, farthest-point start) ----------
+function quantize(d, n, K) {
+    const px = i => [d[i * 4], d[i * 4 + 1], d[i * 4 + 2]];
+    const dist = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2;
+    const C = [px(n >> 1)];
+    const md = new Float32Array(n).fill(Infinity);
+    while (C.length < K) {                       // spread the starting colours out
+        let bi = 0, bv = -1;
+        for (let i = 0; i < n; i++) {
+            md[i] = Math.min(md[i], dist(px(i), C[C.length - 1]));
+            if (md[i] > bv) { bv = md[i]; bi = i; }
+        }
+        C.push(px(bi));
+    }
+    const lab = new Uint8Array(n);
+    for (let it = 0; it < 6; it++) {
+        const sum = C.map(() => [0, 0, 0, 0]);
+        for (let i = 0; i < n; i++) {
+            const p = px(i);
+            let b = 0, bv = Infinity;
+            for (let k = 0; k < K; k++) { const v = dist(p, C[k]); if (v < bv) { bv = v; b = k; } }
+            lab[i] = b;
+            const s = sum[b]; s[0] += p[0]; s[1] += p[1]; s[2] += p[2]; s[3]++;
+        }
+        sum.forEach((s, k) => { if (s[3]) C[k] = [s[0] / s[3], s[1] / s[3], s[2] / s[3]]; });
+    }
+    return { lab, C };
+}
+
+// ---------- 2b. NEW: colour fill = horizontal scanline runs, one pen colour at a time ----------
+function fillStrokes(lab, C, w, h) {
+    const out = [];
+    const order = C.map((c, k) => k).sort((a, b) => lum(C[b]) - lum(C[a]));   // light -> dark
+    for (const k of order) {
+        const c = C[k];
+        if (lum(c) > 235) continue;              // near-white = the paper, leave blank
+        const color = `rgb(${c.map(Math.round)})`;
+        for (let y = 0; y < h; y++) {
+            const runs = [];
+            let x = 0;
+            while (x < w) {
+                if (lab[y * w + x] !== k) { x++; continue; }
+                const x0 = x;
+                while (x < w && lab[y * w + x] === k) x++;
+                runs.push([x0 - 0.5, x - 0.5]);
+            }
+            if (y % 2) { runs.reverse(); runs.forEach(r => r.reverse()); }    // zig-zag to save travel
+            runs.forEach(r => out.push({ color, pts: [[r[0], y], [r[1], y]] }));
+        }
+    }
+    return out;
+}
+
+// ---------- 2c. Outline tracing (unchanged) ----------
 function traceStrokes(edge, w, h) {
     const visited = new Uint8Array(w * h);
     let todo = [];
     for (let i = 0; i < w * h; i++) if (edge[i]) todo.push(i);
     const strokes = [];
-    let cx = 0, cy = 0;                         // where the pen currently is (pixels)
-
+    let cx = 0, cy = 0;
     while (true) {
         todo = todo.filter(i => !visited[i]);
         if (!todo.length) break;
-
-        // start at the unvisited edge pixel closest to the pen (short pen-up travel)
         let best = -1, bd = Infinity;
         for (const i of todo) {
             const d = (i % w - cx) ** 2 + ((i / w | 0) - cy) ** 2;
@@ -387,8 +433,6 @@ function traceStrokes(edge, w, h) {
         let x = best % w, y = best / w | 0, dx = 0, dy = 0;
         const pts = [[x, y]];
         visited[best] = 1;
-
-        // keep walking to the neighbour that best continues the current direction
         while (true) {
             let nb = null, bs = -Infinity;
             for (let oy = -1; oy <= 1; oy++) {
@@ -408,12 +452,11 @@ function traceStrokes(edge, w, h) {
             pts.push([x, y]);
         }
         cx = x; cy = y;
-        if (pts.length >= 4) strokes.push(pts);   // drop tiny specks of noise
+        if (pts.length >= 4) strokes.push(pts);
     }
     return strokes;
 }
 
-// Ramer-Douglas-Peucker: fewer points => smoother, faster robot motion
 function simplify(p, eps) {
     if (p.length < 3) return p;
     const a = p[0], b = p[p.length - 1];
@@ -427,31 +470,34 @@ function simplify(p, eps) {
     return simplify(p.slice(0, mi + 1), eps).slice(0, -1).concat(simplify(p.slice(mi), eps));
 }
 
-// pixel coords -> SVG workspace coords (keeps aspect ratio, centred on the paper)
-function toWorkspace(strokes, w, h) {
+// EDITED: strokes are now {pts, color}; optional wmul = pen width as a multiple of one pixel
+function toWorkspace(strokes, w, h, wmul) {
     const s = Math.min(DRAW_BOX.w / w, DRAW_BOX.h / h);
     const ox = DRAW_BOX.x0 + (DRAW_BOX.w - w * s) / 2;
     const oy = DRAW_BOX.y0 + (DRAW_BOX.h - h * s) / 2;
-    return strokes.map(st => st.map(p => [ox + p[0] * s, oy + p[1] * s]));
+    return strokes.map(st => ({
+        color: st.color,
+        width: wmul ? s * wmul : 1.2,
+        pts: st.pts.map(p => [ox + (p[0] + 0.5) * s, oy + (p[1] + 0.5) * s])
+    }));
 }
 
 // ---------- 3. Robot motion ----------
-// Safety: keep targets inside the arm's reach (base is at (-200,0), reach 100..300)
 function moveArm(x, y) {
     const gx = x + 200, r = Reach(gx, y);
     if (r > 295 || r < 105) {
         const k = (r > 295 ? 295 : 105) / r;
         x = gx * k - 200; y = y * k;
     }
-    LL(x, y);              // existing: IK -> joint positions -> DrawLoop
+    LL(x, y);
     tcp = [x, y];
 }
 
-function newPathEl() {
+function newPathEl(color, width) {               // EDITED: colour + width
     const p = document.createElementNS(SVGNS, "path");
     p.setAttribute("fill", "none");
-    p.setAttribute("stroke", "black");
-    p.setAttribute("stroke-width", "1.2");
+    p.setAttribute("stroke", color);
+    p.setAttribute("stroke-width", width);
     p.setAttribute("stroke-linecap", "round");
     p.setAttribute("stroke-linejoin", "round");
     drawLayer.appendChild(p);
@@ -468,22 +514,23 @@ function stopDrawing() {
 
 function runDrawing(strokes) {
     stopDrawing();
-    // waypoint list: first point of each stroke = pen-up travel, the rest = pen-down
     const moves = [];
-    strokes.forEach(s => s.forEach((p, i) => moves.push({ x: p[0], y: p[1], pen: i > 0 })));
-    if (!moves.length) { setStatus("No edges found - lower the threshold"); return; }
+    strokes.forEach(s => s.pts.forEach((p, i) =>
+        moves.push({ x: p[0], y: p[1], pen: i > 0, color: s.color, width: s.width })));
+    if (!moves.length) { setStatus("Nothing to draw - try a lower threshold"); return; }
 
     let cur = [tcp[0], tcp[1]], k = 0, pathEl = null, d = "", last = performance.now();
+    let penColor = "black";
     PenUp = true;
 
     function frame(now) {
-        let t = Math.min(0.05, (now - last) / 1000);   // seconds to spend this frame
+        let t = Math.min(0.05, (now - last) / 1000);
         last = now;
-        const speed = +document.getElementById("speed").value;   // units/sec while drawing
+        const speed = val("speed", 200);
 
         while (t > 0 && k < moves.length) {
             const m = moves[k];
-            const vel = m.pen ? speed : speed * 4;                // travel faster pen-up
+            const vel = m.pen ? speed : speed * 4;
             const dx = m.x - cur[0], dy = m.y - cur[1];
             const dist = Math.hypot(dx, dy);
             const step = vel * t;
@@ -493,7 +540,8 @@ function runDrawing(strokes) {
 
             if (m.pen) {
                 PenUp = false;
-                if (!pathEl) { pathEl = newPathEl(); d = `M${cur[0]},${cur[1]}`; }
+                penColor = m.color;
+                if (!pathEl) { pathEl = newPathEl(m.color, m.width); d = `M${cur[0]},${cur[1]}`; }
                 d += ` L${nx},${ny}`;
                 pathEl.setAttribute("d", d);
             } else {
@@ -504,7 +552,8 @@ function runDrawing(strokes) {
         }
 
         moveArm(cur[0], cur[1]);
-        document.getElementById("EE").setAttribute("fill", PenUp ? "green" : "red");
+        // end-effector shows the pen: green = lifted, otherwise the colour being drawn
+        document.getElementById("EE").setAttribute("fill", PenUp ? "green" : penColor);
 
         if (k < moves.length) {
             setStatus(`Drawing... ${Math.round(100 * k / moves.length)}%`);
@@ -530,12 +579,20 @@ document.getElementById("imgInput").addEventListener("change", e => {
 document.getElementById("drawBtn").addEventListener("click", () => {
     if (!imgEl) { setStatus("Choose an image first"); return; }
     setStatus("Processing...");
-    setTimeout(() => {   // let the status text paint first
-        const { g, w, h } = imageToGray(imgEl);
-        const thr = +document.getElementById("detail").value * 4;
-        const edge = detectEdges(blurGray(g, w, h), w, h, thr);
-        const strokes = traceStrokes(edge, w, h).map(s => simplify(s, 0.8));
-        runDrawing(toWorkspace(strokes, w, h));
+    setTimeout(() => {
+        let all = [];
+        if (isOn("fillOn", true)) {                       // colour layers first
+            const f = imageToGray(imgEl, RES_FILL);
+            const { lab, C } = quantize(f.d, f.w * f.h, val("colors", 5));
+            all = all.concat(toWorkspace(fillStrokes(lab, C, f.w, f.h), f.w, f.h, 1.15));
+        }
+        if (isOn("outlineOn", true)) {                    // black outlines on top
+            const { g, w, h } = imageToGray(imgEl);
+            const edge = detectEdges(blurGray(g, w, h), w, h, val("detail", 30) * 4);
+            const lines = traceStrokes(edge, w, h).map(s => ({ pts: simplify(s, 0.8), color: "#000" }));
+            all = all.concat(toWorkspace(lines, w, h));
+        }
+        runDrawing(all);
     }, 20);
 });
 
@@ -545,7 +602,8 @@ document.getElementById("stopBtn").addEventListener("click", () => {
     setStatus("Cleared");
 });
 
-
+// rest pose: the removed start-up stroke used to be what made the arm appear
+moveArm(DRAW_BOX.x0 + DRAW_BOX.w / 2, DRAW_BOX.y0 + DRAW_BOX.h / 2);
 
 
 
