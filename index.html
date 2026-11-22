@@ -5,7 +5,14 @@
  
 </head>
 <body>
-
+<div id="controls">
+  <input type="file" id="imgInput" accept="image/*">
+  <label>Edge threshold <input type="range" id="detail" min="10" max="100" value="30"></label>
+  <label>Speed <input type="range" id="speed" min="40" max="600" value="150"></label>
+  <button id="drawBtn">Draw</button>
+  <button id="stopBtn">Stop / Clear</button>
+  <span id="status"></span>
+</div>
   <svg id="robotArm" width="800" height="800" viewBox="-200 -200 400 400">
     <g transform="translate(-200, 0)" >
     <circle id="center" r="5" fill="red" />
